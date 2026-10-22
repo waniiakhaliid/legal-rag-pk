@@ -1,15 +1,36 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
+# Secrets (never commit API keys)
 .env
-data/raw/
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Source PDFs and extracted text cache
+data/raw/*
+!data/raw/.gitkeep
+
+# Ingestion progress files
+checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local vector stores / model caches (if you switch to Chroma, FAISS, or local models)
 chroma_db/
-*.pyc
+*.faiss
+*.pkl
+.cache/
+huggingface/
+
+# Evaluation outputs
+eval_results/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
