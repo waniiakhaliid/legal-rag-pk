@@ -1,129 +1,217 @@
-# Pakistani Legal RAG: Ingestion & Embedding
+# Mizaan (legal-rag-pk)
 
-The first stage of a retrieval-augmented generation (RAG) system that will let ordinary people query Pakistani law in plain English or Urdu.
+**A bilingual (English/Urdu) AI assistant for Pakistani law, built on Retrieval-Augmented Generation (RAG).**
 
-**Current status:** ingestion and embedding only. This stage reads the legal PDFs, splits them into section-level chunks, embeds them with Gemini, and stores them in Pinecone. Retrieval, answer generation and the chat UI are planned (see [Roadmap](#roadmap)).
+Ask a legal question in plain English or Urdu and Mizaan retrieves the relevant provisions from the Pakistan Penal Code, Code of Criminal Procedure, Code of Civil Procedure and the Constitution of Pakistan. It then explains them in plain language, quoting the statute word for word and citing the exact sections. Answers are generated only from retrieved text, never from the model's memory.
 
-## Corpus
+> **Status:** Working prototype. The full pipeline (PDF ingestion → vector search → streaming answers with citations → React chat UI) runs end to end. Retrieval quality is under active improvement; see [Known Limitations](#known-limitations) and [Roadmap](#roadmap).
 
-| Document | Version | Source |
-|---|---|---|
-| Constitution of Pakistan | 1973 (with amendments) | [na.gov.pk](https://na.gov.pk/en/constitution.php) |
-| Code of Criminal Procedure | 1898 | [pakistancode.gov.pk](https://pakistancode.gov.pk) |
-| Pakistan Penal Code | 1860 | [pakistancode.gov.pk](https://pakistancode.gov.pk) |
-| Code of Civil Procedure | 1908 | [pakistancode.gov.pk](https://pakistancode.gov.pk) |
+<!-- Add a screenshot or demo GIF here, e.g. ![Mizaan screenshot](docs/screenshot.png) -->
+https://drive.google.com/file/d/1w3lYKqAHgeI-QJ8ZwkoEsC0otOoJppNk/view?usp=drive_link
 
-The PDFs are not committed to this repository. Download them from the sources above.
+---
 
-## How ingestion works
+## Highlights
+
+- **Grounded, citable answers.** Each answer quotes the applicable sections verbatim, explains them in plain language, and then relates them cautiously to the user's situation. If no provision matches, the assistant says so instead of guessing.
+- **Bilingual.** Questions can be asked in English, Urdu script, or Roman Urdu. Urdu answers keep the quoted law in its original wording while the explanation is written in Urdu.
+- **Structure-aware ingestion.** PDFs are parsed section by section. Each chunk carries a header and metadata (document, section number, section title), and footnotes/amendment notes are separated into their own chunk type.
+- **Smart query handling.** An LLM step rewrites everyday descriptions ("someone threatened me") into legal concepts, resolves follow-up questions using chat history, detects the language, and routes to the right statute.
+- **Exact section lookup plus semantic search.** Queries like "Section 302" or "دفعہ ۳۰۲" (including Urdu/Arabic-Indic digits) trigger a metadata-filtered lookup that runs in parallel with the dense vector search.
+- **Streaming UI.** The backend streams over Server-Sent Events: sources arrive first (rendered as citation chips), then the answer tokens stream in with Markdown rendering.
+- **Resilient by design.** Resumable ingestion with checkpoints and idempotent vector IDs, retries on transient API errors, and automatic fallback to a second Gemini model on quota or timeout failures.
+
+---
+
+## How It Works
 
 ```
-PDF
- ↓  pdfplumber: extract text, separate body from footnotes
- ↓  cache in data/raw/extracted_text/
- ↓  regex: split into law sections (e.g. "302. Punishment for murder")
- ↓  LangChain splitter: break very long sections into smaller pieces
- ↓  prefix each chunk with a label: [Pakistan Penal Code | Section 302 - ...]
- ↓  Gemini embedding API: one vector per chunk
- ↓  Pinecone: upsert vectors + metadata
+ INGESTION (offline)
+ ───────────────────
+ Legal PDFs ──► pdfplumber extraction ──► section-aware chunking ──► Gemini embeddings ──► Pinecone
+ (PPC, CrPC,    (strips headers/page      (regex section split,      (gemini-embedding-001,  (cosine, 3072-d,
+  CPC,           footers; separates        recursive splitter for     checkpointed every      metadata: doc type,
+  Constitution)  footnotes)                long sections)             50 chunks)              section no./title)
+
+ QUERY (online)
+ ──────────────
+ User question
+      │
+      ▼
+ 1. prepare_query   Gemini Flash-Lite: detect language, rewrite as a standalone English
+      │             legal search query, pick the statute (or none)
+      ▼
+ 2. retrieve        Pinecone dense search (sections only)  ┐ run in parallel
+      │             Exact section-number lookup (if cited) ┘ → merge, de-duplicate, top 8
+      ▼
+ 3. stream_answer   Gemini, strictly grounded in the numbered passages
+      │             (quote → plain meaning → how it may apply), in the user's language
+      ▼
+ FastAPI /chat (SSE: sources → tokens → done)  ──►  React chat UI
 ```
 
-**Key details**
+---
 
-- **Footnotes are kept separately.** Footnotes and amendment references are cut from the body and stored as their own chunks (`content_type = "footnote"`), so amendments stay searchable without polluting the section text.
-- **The Constitution has its own extractor.** Its pages use a different layout, so it crops to a fixed body area and ignores headers.
-- **Chunk IDs are content hashes** (`md5(source + text)`). Re-embedding the same chunk overwrites the same record, so reruns never create duplicates.
-- **Metadata stored with each vector:** `text`, `source`, `doc_type`, `section_number`, `section_title`, `content_type`.
+## Tech Stack
 
-## Resuming after an interruption
-
-Embedding makes one Gemini call per chunk, so free-tier quotas can stop a run partway through. The script is built to resume safely. It uses three kinds of local files:
-
-| File | Meaning |
+| Layer | Technology |
 |---|---|
-| `data/raw/extracted_text/<name>.txt` | Text already extracted from the PDF |
-| `checkpoints/<name>.txt` | Progress in the current PDF (chunk number) |
-| `checkpoints/<name>.done` | This PDF is completely ingested; skip it |
+| Language / packaging | Python, [uv](https://github.com/astral-sh/uv) |
+| API | FastAPI, Server-Sent Events streaming, Pydantic validation |
+| Vector database | Pinecone (serverless, cosine similarity) |
+| Embeddings | Google Gemini `gemini-embedding-001` (3072 dimensions) |
+| LLMs | Gemini Flash (answer generation), Gemini Flash-Lite (query rewriting), plus a fallback Flash model |
+| PDF parsing / chunking | pdfplumber, LangChain `RecursiveCharacterTextSplitter` |
+| Front end | React + Vite, `react-markdown`, custom CSS (Fraunces / Inter / Noto Nastaliq Urdu) |
 
-- Progress is saved to Pinecone and the checkpoint every 50 chunks, and also when all retries fail.
-- Failed calls are retried 4 times, waiting 20, 40, 60 and 80 seconds.
-- On the next run, finished PDFs are skipped and unfinished ones resume from the checkpoint.
+---
 
-> Resuming relies on chunks being rebuilt in the same order. If you change a PDF, `CHUNK_SIZE` or `CHUNK_OVERLAP` mid-run, delete the `checkpoints/` folder and start that PDF again.
+## Data
 
-## Project structure
+The corpus consists of four Pakistani legal texts, placed as PDFs in `data/raw/`:
 
-```
-LegalRag/
-├── data/
-│   └── raw/                # source PDFs (not committed)
-│       └── extracted_text/ # cached extraction output
-├── checkpoints/            # resume markers (not committed)
-├── src/
-│   ├── config.py           # settings and API keys
-│   └── ingest.py           # extract → chunk → embed → store
-├── .env                    # API keys (not committed)
-├── pyproject.toml
-└── uv.lock
-```
+| Document | Type |
+|---|---|
+| Pakistan Penal Code | `penal_code` |
+| Code of Criminal Procedure | `criminal_procedure` |
+| Code of Civil Procedure | `civil_procedure` |
+| Constitution of Pakistan | `constitution` |
 
-## Setup
+The Constitution uses a dedicated extraction mode (column cropping and header removal) because of its page layout. Extracted text is cached in `data/processed/extracted_text/` so re-runs skip PDF parsing.
 
-**1. Install dependencies** (uses [uv](https://docs.astral.sh/uv/))
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.10+ (see `.python-version`) and [uv](https://github.com/astral-sh/uv)
+- Node.js 18+ (for the front end)
+- A [Google AI Studio](https://aistudio.google.com/) API key (Gemini)
+- A [Pinecone](https://www.pinecone.io/) API key
+
+### 1. Install
 
 ```bash
-git clone <your-repo-url>
-cd LegalRag
-uv sync
+git clone https://github.com/waniiakhaliid/legal-rag-pk.git
+cd legal-rag-pk
+uv sync                      # installs Python dependencies from pyproject.toml / uv.lock
+cd frontend && npm install && cd ..
 ```
 
-**2. Get API keys**
+### 2. Configure
 
-- Gemini: [aistudio.google.com](https://aistudio.google.com)
-- Pinecone: [pinecone.io](https://pinecone.io) (the script creates the index if it does not exist)
+Copy `src/.env.example` to `src/.env` and fill in your keys:
 
-**3. Create a `.env` file in the project root**
-
-```
-GEMINI_API_KEY=your_key_here
-PINECONE_API_KEY=your_key_here
+```env
+GEMINI_API_KEY=your_gemini_key
+PINECONE_API_KEY=your_pinecone_key
 ```
 
-Other settings (index name, embedding model and dimension, chunk size and overlap, data folder) live in `src/config.py`.
+Model names, chunk size, index name and retrieval settings live in `src/config.py`.
 
-**4. Add the PDFs** to `data/raw/`. The file names must match these, because the extraction and labeling rules are keyed by file name:
+### 3. Build the vector index
 
-- `PakistanPenalCode.pdf`
-- `CodeofCriminalProcedure.pdf`
-- `CodeOfCivilProcedure.pdf`
-- `Constitution_of_Pakistan_Current.pdf`
-
-**5. Run ingestion**
+Put the legal PDFs in `data/raw/`, then run from the repository root:
 
 ```bash
 uv run python src/ingest.py
 ```
 
-If the Gemini quota runs out, the script stops and saves its progress. Run the same command again later to continue.
+Ingestion creates the Pinecone index if needed and embeds chunks with automatic checkpoints. If the API quota runs out mid-run, re-run the same command and it resumes where it stopped. Finished documents are skipped.
 
-## Changing the embedding model
+### 4. Run the backend
 
-Vectors from different models cannot be mixed. If you change `GEMINI_EMBEDDING_MODEL` (or move to a different provider), then:
+```bash
+uv run uvicorn api:app --app-dir src --reload --port 8000
+```
 
-1. Create a new Pinecone index with the new `EMBEDDING_DIMENSION`.
-2. Delete the `checkpoints/` folder.
-3. Re-run ingestion.
+Health check: `GET http://localhost:8000/health`
 
-## Limitations
+### 5. Run the front end
 
-- Embedding is one API call per chunk, so a full ingestion can take several runs on a free tier.
-- Section detection uses regular expressions on the extracted text. Pages with unusual layouts may be split imperfectly, so spot-check a few chunks in Pinecone after ingesting.
-- The corpus is static. When legislation changes, download the new PDFs and re-ingest.
-- This is a research and learning project, not legal advice.
+```bash
+cd frontend
+npm run dev
+```
+
+Open the URL Vite prints (default `http://localhost:5173`). The front end calls the API at `http://localhost:8000/chat`; change `API_URL` in `frontend/src/LegalChat.jsx` if needed.
+
+---
+
+## API
+
+`POST /chat`
+
+```json
+{
+  "message": "What is the punishment for rash driving?",
+  "history": [{ "role": "user", "content": "..." }, { "role": "assistant", "content": "..." }]
+}
+```
+
+Returns a Server-Sent Events stream:
+
+| Event | Payload |
+|---|---|
+| `sources` | List of cited passages (document, section number/title, snippet, similarity score) |
+| `token` | A chunk of the streamed answer text |
+| `done` | `{ "language": "en" \| "ur" }` |
+| `error` | A user-facing error message |
+
+---
+
+## Project Structure
+
+```
+legal-rag-pk/
+├── src/
+│   ├── ingest.py        # PDF extraction, section-aware chunking, embedding, Pinecone upsert
+│   ├── rag.py           # query rewriting, hybrid retrieval, grounded streaming generation
+│   ├── api.py           # FastAPI app with the SSE /chat endpoint
+│   ├── config.py        # models, index and chunking settings
+│   └── cli.py           # command-line entry point
+├── frontend/            # React + Vite chat UI (splash screen, streaming, citations)
+├── tools/               # helper scripts for inspecting chunks and models
+├── data/
+│   ├── raw/             # source PDFs
+│   └── processed/       # cached extracted text
+├── checkpoints/         # ingestion progress markers
+└── pyproject.toml
+```
+
+---
+
+## Known Limitations
+
+- **Chunking is the main weakness.** Sections are detected with regular expressions and long sections are split by a character-based splitter (1,000 characters, 100 overlap). Provisos, explanations, illustrations and sub-sections can end up separated from their parent clause, and some sections are mis-detected. This affects retrieval quality and is the top improvement priority.
+- Retrieval returns one chunk per section, so very long provisions may only be partially visible to the model.
+- The corpus covers only four core statutes; it does not include case law, provincial laws or special statutes.
+- No formal evaluation set yet, so answer quality has been checked manually rather than measured.
+- Embedding during ingestion is sequential (one chunk per request), which is slow for large documents.
+- The front end is a minimal demo interface, and CORS is configured for localhost only.
+
+---
 
 ## Roadmap
 
-- [ ] Retrieval: Pinecone semantic search, optional BM25, reranking
-- [ ] Answer generation with section citations
-- [ ] Chat UI
-- [ ] Evaluation on a golden question set (English and Urdu)
+- [ ] Improve chunking: hierarchy-aware splitting that keeps provisos, explanations and sub-sections attached to their section, with richer metadata
+- [ ] Add a reranking step (a reranker is planned; `TOP_K_RERANK` is already reserved in the config)
+- [ ] Build an evaluation set of legal questions and measure retrieval hit-rate and answer faithfulness
+- [ ] Batch embeddings during ingestion for faster indexing
+- [ ] Expand the corpus: more federal statutes, provincial laws and court judgments
+- [ ] Add Urdu-language source documents for native Urdu retrieval
+- [ ] Deployment (hosted backend and front end, restricted CORS)
+
+---
+
+## Disclaimer
+
+Mizaan is an educational and experimental project. It provides **general legal information only and is not legal advice**. Answers may be incomplete or inaccurate. Always consult a qualified lawyer for legal matters.
+
+---
+
+## Author
+
+**Your Name** · [LinkedIn](https://linkedin.com/in/waniiakhaliid) · [GitHub](https://github.com/waniiakhaliid)
+

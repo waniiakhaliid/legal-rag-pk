@@ -16,7 +16,9 @@ EMBEDDING_DIMENSION = 3072
 
 # Gemini
 GEMINI_EMBEDDING_MODEL = "models/gemini-embedding-001"
-GEMINI_GENERATION_MODEL = "gemini-2.0-flash"
+GEMINI_GENERATION_MODEL = "gemini-3-flash-preview"   # final answer
+GEMINI_PREPARE_MODEL    = "gemini-flash-lite-latest" # query rewrite (small JSON task)
+GEMINI_FALLBACK_MODEL   = "gemini-3.6-flash"
 # chunking
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 100

@@ -6,6 +6,7 @@
 
 # Source PDFs and extracted text cache
 data/raw/*
+data/processed/*
 !data/raw/.gitkeep
 
 # Ingestion progress files
@@ -34,3 +35,8 @@ eval_results/
 Thumbs.db
 .vscode/
 .idea/
+
+
+.venv/
+
+.tools/*
